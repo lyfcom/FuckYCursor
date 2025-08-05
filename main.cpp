@@ -174,6 +174,65 @@ __forceinline bool ValidateCode(const BYTE* data) noexcept {
     return true;
 }
 
+// 高性能扫描并直接提取code，找到即返回true
+bool ScanForCode(HANDLE hProcess, char* outCode) noexcept {
+    MEMORY_BASIC_INFORMATION mbi;
+    DWORD_PTR address = 0;
+
+    static thread_local std::vector<BYTE> buffer;
+    buffer.reserve(BUFFER_SIZE + TARGET_STRING_SIZE + POINTER_OFFSET);
+
+    while (VirtualQueryEx(hProcess, (LPCVOID)address, &mbi, sizeof(mbi))) {
+        if (mbi.State == MEM_COMMIT &&
+            (mbi.Protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) {
+
+            DWORD_PTR regionStart = (DWORD_PTR)mbi.BaseAddress;
+            SIZE_T regionSize = mbi.RegionSize;
+
+            for (SIZE_T offset = 0; offset < regionSize; offset += BUFFER_SIZE) {
+                SIZE_T chunkSize = std::min< SIZE_T >(BUFFER_SIZE, regionSize - offset);
+                if (chunkSize < TARGET_STRING_SIZE) break;
+
+                buffer.resize(chunkSize + TARGET_STRING_SIZE - 1);
+                SIZE_T bytesRead = 0;
+                if (!ReadProcessMemory(hProcess, (LPCVOID)(regionStart + offset), buffer.data(), chunkSize, &bytesRead)) {
+                    continue;
+                }
+
+                // 处理块末尾重叠
+                if (offset + chunkSize < regionSize && bytesRead >= TARGET_STRING_SIZE) {
+                    SIZE_T overlap = 0;
+                    ReadProcessMemory(hProcess, (LPCVOID)(regionStart + offset + chunkSize),
+                                      buffer.data() + bytesRead, TARGET_STRING_SIZE - 1, &overlap);
+                    bytesRead += overlap;
+                }
+
+                const BYTE* searchStart = buffer.data();
+                const BYTE* searchEnd = buffer.data() + bytesRead;
+
+                while (searchStart <= searchEnd - TARGET_STRING_SIZE) {
+                    const BYTE* found = FastSearch(searchStart, searchEnd - searchStart, TARGET_STRING, TARGET_STRING_SIZE);
+                    if (!found) break;
+
+                    DWORD_PTR foundAddr = regionStart + offset + (found - buffer.data());
+                    BYTE codeBytes[6];
+                    SIZE_T read6 = 0;
+                    if (ReadProcessMemory(hProcess, (LPCVOID)(foundAddr + POINTER_OFFSET), codeBytes, 6, &read6) && read6 == 6) {
+                        if (ValidateCode(codeBytes)) {
+                            memcpy(outCode, codeBytes, 6);
+                            outCode[6] = '\0';
+                            return true;
+                        }
+                    }
+                    searchStart = found + 1;
+                }
+            }
+        }
+        address = (DWORD_PTR)mbi.BaseAddress + mbi.RegionSize;
+    }
+    return false;
+}
+
 // 高效剪贴板操作
 __forceinline bool CopyToClipboard(const char* text, size_t length) noexcept {
     if (!OpenClipboard(nullptr)) {
@@ -237,38 +296,10 @@ int main() {
     
     // 主循环：持续搜索直到找到code
     while (!found) {
-        // 高效搜索目标字符串
-        std::vector<DWORD_PTR> foundAddresses;
-        std::cout << "开始搜索目标字符串..." << std::endl;
-        
-        while (foundAddresses.empty()) {
-            foundAddresses = PatternScan(hProcess, TARGET_STRING, TARGET_STRING_SIZE);
-            if (foundAddresses.empty()) {
-                std::cout << "搜索中..." << std::endl;
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            } else {
-                std::cout << "找到地址数量: " << foundAddresses.size() << std::endl;
-            }
-        }
-        
-        // 优化的代码搜索循环
-        for (DWORD_PTR address : foundAddresses) {
-            BYTE memoryChunk[8]; // 稍微多读一点，避免边界问题
-            SIZE_T bytesRead;
-            
-            if (ReadProcessMemory(hProcess, (LPCVOID)(address + POINTER_OFFSET), 
-                                 memoryChunk, 6, &bytesRead) && bytesRead == 6) {
-                
-                if (ValidateCode(memoryChunk)) {
-                    memcpy(code, memoryChunk, 6);
-                    found = true;
-                    break;
-                }
-            }
-        }
-        
+        std::cout << "扫描内存..." << std::endl;
+        found = ScanForCode(hProcess, code);
         if (!found) {
-            std::cout << "未找到有效code，重试中..." << std::endl;
+            std::cout << "未找到有效code，1秒后重试..." << std::endl;
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     }
